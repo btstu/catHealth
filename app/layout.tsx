@@ -1,7 +1,10 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
+import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
+import { AuthProvider } from "@/components/auth-provider";
+import { SiteHeader } from "@/components/site-header";
 
 const inter = Inter({
   subsets: ["latin"],
@@ -9,8 +12,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "CatHealth - Pet Diagnosis Assistant",
-  description: "Upload a photo of your cat's health issue for a professional diagnosis",
+  title: "CatHealth - AI Pet Diagnosis Assistant",
+  description: "Upload photos of your cat's health concerns for AI-powered diagnosis suggestions",
 };
 
 export default function RootLayout({
@@ -21,8 +24,20 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={inter.className}>
-        {children}
-        <Toaster />
+        <AuthProvider>
+          <ThemeProvider
+            attribute="class"
+            defaultTheme="light"
+            enableSystem={false}
+            disableTransitionOnChange
+          >
+            <div className="relative flex min-h-screen flex-col">
+              <SiteHeader />
+              <main className="flex-1">{children}</main>
+            </div>
+            <Toaster />
+          </ThemeProvider>
+        </AuthProvider>
       </body>
     </html>
   );

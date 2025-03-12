@@ -4,7 +4,7 @@ import Image from "next/image";
 import { useState } from "react";
 
 export function CatLogo() {
-  const [src, setSrc] = useState("/cat-logo.svg");
+  const [src, setSrc] = useState("/cat-logo.png");
 
   const handleError = () => {
     // Fallback to an inline SVG if the image fails to load
