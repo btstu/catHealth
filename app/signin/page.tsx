@@ -1,8 +1,13 @@
 "use client"
 
 import { Button } from "@/components/ui/button"
-import { signIn } from "next-auth/react"
-import { useSearchParams } from "next/navigation"
+import { useSearchParams, useRouter } from "next/navigation"
+import { useEffect, useState } from "react"
+import { createClient } from '@/utils/supabase/client'
+import { toast } from "sonner"
+import { Input } from "@/components/ui/input"
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 
 function GoogleIcon() {
   return (
@@ -30,24 +35,165 @@ function GoogleIcon() {
 export default function SignIn() {
   const searchParams = useSearchParams()
   const callbackUrl = searchParams?.get("callbackUrl") || "/"
+  const router = useRouter()
+  const [loading, setLoading] = useState(false)
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [isSignUp, setIsSignUp] = useState(false)
+  const supabase = createClient()
+
+  // Check if user is already signed in
+  useEffect(() => {
+    const checkUser = async () => {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (session) {
+        router.push(callbackUrl)
+      }
+    }
+    
+    checkUser()
+  }, [supabase, router, callbackUrl])
+
+  const handleGoogleSignIn = async () => {
+    try {
+      setLoading(true)
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: `${window.location.origin}/auth/callback?callbackUrl=${encodeURIComponent(callbackUrl)}`,
+        },
+      })
+      
+      if (error) throw error
+    } catch (error: any) {
+      toast.error('Error signing in: ' + error.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+  
+  const handleEmailSignIn = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!email || !password) {
+      toast.error('Please enter both email and password')
+      return
+    }
+    
+    try {
+      setLoading(true)
+      
+      if (isSignUp) {
+        // Sign up with email and password
+        const { error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            emailRedirectTo: `${window.location.origin}/auth/callback?callbackUrl=${encodeURIComponent(callbackUrl)}`
+          }
+        })
+        
+        if (error) throw error
+        
+        toast.success('Sign up successful! Please check your email to confirm your account.')
+      } else {
+        // Sign in with email and password
+        const { error } = await supabase.auth.signInWithPassword({
+          email,
+          password
+        })
+        
+        if (error) throw error
+        
+        // If successful, the onAuthStateChange listener will update the user state
+        router.push(callbackUrl)
+      }
+    } catch (error: any) {
+      toast.error(`Error: ${error.message}`)
+    } finally {
+      setLoading(false)
+    }
+  }
 
   return (
     <div className="container mx-auto min-h-screen flex items-center justify-center px-4">
-      <div className="max-w-md w-full mx-auto text-center space-y-8">
-        <div className="space-y-4">
-          <h1 className="text-3xl font-bold">Sign in to CatHealth</h1>
-          <p className="text-gray-500">
-            Sign in to access the AI-powered cat diagnosis feature
-          </p>
-        </div>
-        <Button 
-          size="lg"
-          onClick={() => signIn("google", { callbackUrl })}
-          className="w-full bg-white text-gray-900 hover:bg-gray-100 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
-        >
-          <GoogleIcon />
-          Sign in with Google
-        </Button>
+      <div className="max-w-md w-full mx-auto">
+        <h1 className="text-3xl font-bold text-center mb-6">Sign in to CatHealth</h1>
+        <Card>
+          <CardHeader>
+            <CardTitle>{isSignUp ? 'Create an Account' : 'Sign In'}</CardTitle>
+            <CardDescription>
+              {isSignUp 
+                ? 'Create a new account to access all features' 
+                : 'Sign in to access the AI-powered cat diagnosis feature'}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Tabs defaultValue="email" className="w-full">
+              <TabsList className="grid w-full grid-cols-2 mb-4">
+                <TabsTrigger value="email">Email</TabsTrigger>
+                <TabsTrigger value="social">Social</TabsTrigger>
+              </TabsList>
+              
+              <TabsContent value="email">
+                <form onSubmit={handleEmailSignIn} className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="email">Email</label>
+                    <Input 
+                      id="email"
+                      type="email" 
+                      placeholder="your@email.com" 
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      required
+                    />
+                  </div>
+                  
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="password">Password</label>
+                    <Input 
+                      id="password"
+                      type="password" 
+                      placeholder="Your password" 
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      required
+                    />
+                  </div>
+                  
+                  <Button 
+                    type="submit"
+                    className="w-full"
+                    disabled={loading}
+                  >
+                    {loading ? 'Loading...' : (isSignUp ? 'Sign Up' : 'Sign In')}
+                  </Button>
+                </form>
+              </TabsContent>
+              
+              <TabsContent value="social">
+                <div className="space-y-4">
+                  <Button 
+                    onClick={handleGoogleSignIn}
+                    disabled={loading}
+                    className="w-full bg-white text-gray-900 hover:bg-gray-100 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                  >
+                    <GoogleIcon />
+                    {loading ? 'Loading...' : 'Continue with Google'}
+                  </Button>
+                </div>
+              </TabsContent>
+            </Tabs>
+          </CardContent>
+          <CardFooter className="flex justify-center">
+            <Button 
+              variant="link" 
+              onClick={() => setIsSignUp(!isSignUp)}
+              className="text-sm"
+            >
+              {isSignUp ? 'Already have an account? Sign In' : 'Don\'t have an account? Sign Up'}
+            </Button>
+          </CardFooter>
+        </Card>
       </div>
     </div>
   )

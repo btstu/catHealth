@@ -1,8 +1,8 @@
 "use client"
 
 import Link from "next/link"
-import { AuthButton } from "./auth-button"
 import Image from "next/image"
+import { SupabaseAuthButton } from "./supabase-auth-button"
 
 export function SiteHeader() {
   return (
@@ -16,7 +16,7 @@ export function SiteHeader() {
           <Link href="/diagnose" className="text-sm font-medium hover:text-primary">
             Get Diagnosis
           </Link>
-          <AuthButton />
+          <SupabaseAuthButton />
         </nav>
       </div>
     </header>
