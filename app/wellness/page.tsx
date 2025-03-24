@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
@@ -8,12 +8,14 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Label } from "@/components/ui/label"
 import { createClient } from '@/utils/supabase/client'
 import { toast } from "sonner"
-import Link from "next/link"
-import { useRouter } from "next/navigation"
+
+import { useRouter, useSearchParams } from "next/navigation"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { SupabaseAuthButton } from "@/components/supabase-auth-button"
+
 import Image from "next/image"
 import WellnessPlanVisualization from "@/components/wellness-plan-visualization"
+import ReactMarkdown from "react-markdown"
+import { jsPDF } from "jspdf"
 
 // Custom Progress component that supports custom indicator classes
 const Progress = ({ value = 0, className = "", indicatorClassName = "" }) => {
@@ -38,7 +40,11 @@ export default function WellnessPlanPage() {
   const [wellnessPlanData, setWellnessPlanData] = useState<any | null>(null)
   const [user, setUser] = useState<any | null>(null)
   const [userEmail, setUserEmail] = useState("")
-  const [isPlanGenerated, setIsPlanGenerated] = useState(false) // Add this line to track if the plan has been generated
+  const [isPlanGenerated, setIsPlanGenerated] = useState(false)
+  const [formDataLoaded, setFormDataLoaded] = useState(false)
+  const [isGeneratingPlan, setIsGeneratingPlan] = useState(false)
+  const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
+  const pdfContentRef = useRef<HTMLDivElement>(null);
   const totalSteps = 5
   
   // Form data state
@@ -72,6 +78,25 @@ export default function WellnessPlanPage() {
     primaryGoal: "",
   })
   
+  // Load form data from localStorage on initial render
+  useEffect(() => {
+    // Only attempt to load once
+    if (formDataLoaded) return;
+    
+    try {
+      const savedFormData = localStorage.getItem('catWellnessFormData');
+      if (savedFormData) {
+        const parsedData = JSON.parse(savedFormData);
+        setFormData(parsedData);
+        console.log('Form data loaded from localStorage');
+      }
+    } catch (error) {
+      console.error('Error loading form data from localStorage:', error);
+    }
+    
+    setFormDataLoaded(true);
+  }, [formDataLoaded]);
+  
   // Check authentication status
   useEffect(() => {
     const checkUser = async () => {
@@ -80,11 +105,36 @@ export default function WellnessPlanPage() {
         setIsAuthenticated(true)
         setUser(session.user)
         setUserEmail(session.user.email || "")
+        
+        // Check URL params for returning from auth flow
+        const params = new URLSearchParams(window.location.search);
+        const fromAuth = params.get('fromAuth');
+        
+        if (fromAuth === 'true') {
+          // If returning from auth, check if we have saved form step
+          const savedStep = localStorage.getItem('catWellnessFormStep');
+          if (savedStep) {
+            setCurrentStep(parseInt(savedStep, 10));
+          }
+          
+          // Remove the query parameter using history API to clean up URL
+          const newUrl = window.location.pathname;
+          window.history.replaceState({}, document.title, newUrl);
+        }
       }
     }
     
     checkUser()
-  }, [supabase.auth]) // Dependency here is good
+  }, [supabase.auth])
+  
+  // Save form data to localStorage whenever it changes
+  useEffect(() => {
+    // Only save if the form has been interacted with (not empty default state)
+    if (formDataLoaded && (formData.catName || formData.catBreed || formData.catAge || formData.behaviorIssues.length > 0)) {
+      localStorage.setItem('catWellnessFormData', JSON.stringify(formData));
+      localStorage.setItem('catWellnessFormStep', currentStep.toString());
+    }
+  }, [formData, currentStep, formDataLoaded]);
   
   // Handle form input changes
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
@@ -138,6 +188,12 @@ export default function WellnessPlanPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     
+    // Check if user is authenticated before proceeding
+    if (!isAuthenticated) {
+      toast.error("Please sign in to generate your wellness plan")
+      return
+    }
+    
     // If plan is already generated, don't resubmit
     if (isPlanGenerated) {
       setCurrentStep(6) // Just go to the results page
@@ -145,6 +201,7 @@ export default function WellnessPlanPage() {
     }
     
     setIsSubmitting(true)
+    setIsGeneratingPlan(true)
     
     try {
       // Create form data for API request
@@ -163,7 +220,7 @@ export default function WellnessPlanPage() {
       })
       
       // Add email if authenticated
-      if (isAuthenticated && user?.email) {
+      if (user?.email) {
         apiFormData.append('userEmail', user.email)
       }
       
@@ -189,11 +246,16 @@ export default function WellnessPlanPage() {
       
       // Move to results (step 6)
       setCurrentStep(6)
+      
+      // Clear localStorage data as we've successfully generated the plan
+      localStorage.removeItem('catWellnessFormData');
+      localStorage.removeItem('catWellnessFormStep');
     } catch (error) {
       toast.error('Error generating wellness plan')
       console.error(error)
     } finally {
       setIsSubmitting(false)
+      setIsGeneratingPlan(false)
     }
   }
   
@@ -234,11 +296,409 @@ export default function WellnessPlanPage() {
   
   // Handle sign in redirection
   const handleSignIn = () => {
-    router.push(`/signin?callbackUrl=${encodeURIComponent('/wellness')}`)
+    // Save current form state and step before redirecting
+    localStorage.setItem('catWellnessFormData', JSON.stringify(formData));
+    localStorage.setItem('catWellnessFormStep', currentStep.toString());
+    
+    // Redirect to sign in with a callback URL that includes a flag
+    router.push(`/signin?callbackUrl=${encodeURIComponent('/wellness?fromAuth=true')}`)
   }
   
   // Progress bar calculation
   const progress = ((currentStep - 1) / totalSteps) * 100
+  
+  // Generate and download PDF
+  const handleDownloadPDF = async () => {
+    if (!pdfContentRef.current || !wellnessPlan) return;
+    
+    setIsGeneratingPDF(true);
+    toast.info("Preparing your beautiful wellness plan PDF...");
+    
+    try {
+      // Create a new document directly with jsPDF
+      const pdf = new jsPDF({
+        orientation: 'p',
+        unit: 'mm',
+        format: 'a4',
+        putOnlyUsedFonts: true,
+      });
+      
+      // Page dimensions
+      const pageWidth = 210;  // A4 width in mm
+      const pageHeight = 297; // A4 height in mm
+      const margin = 15;      // Margins in mm
+      const contentWidth = pageWidth - (margin * 2);
+      
+      // Colors
+      const primaryColor = [99, 102, 241] as [number, number, number]; // Indigo
+      const accentColor = [147, 51, 234] as [number, number, number];  // Purple
+      const textColor = [51, 65, 85] as [number, number, number];      // Slate-700
+      const subtitleColor = [71, 85, 105] as [number, number, number]; // Slate-600
+      const bgColor = [248, 250, 252] as [number, number, number];     // Slate-50
+      const boxBgColor = [241, 245, 249] as [number, number, number];  // Slate-100
+      const headerBgColor = [224, 231, 255] as [number, number, number]; // Indigo-100
+      
+      // Function to create a cover page
+      const createCoverPage = () => {
+        // Set background
+        pdf.setFillColor(...bgColor);
+        pdf.rect(0, 0, pageWidth, pageHeight, 'F');
+        
+        // Add decorative top bar
+        pdf.setFillColor(...primaryColor);
+        pdf.rect(0, 0, pageWidth, 20, 'F');
+        
+        // Add paw prints decoration (top right)
+        pdf.setDrawColor(...primaryColor);
+        pdf.setLineWidth(0.5);
+        // Draw some paw prints as simple circles
+        for (let i = 0; i < 4; i++) {
+          pdf.circle(pageWidth - 20 - (i * 15), 40 + (i * 10), 3, 'S');
+          pdf.circle(pageWidth - 25 - (i * 15), 38 + (i * 10), 1.5, 'S');
+          pdf.circle(pageWidth - 15 - (i * 15), 38 + (i * 10), 1.5, 'S');
+        }
+        
+        // Add big title
+        pdf.setFont('helvetica', 'bold');
+        pdf.setTextColor(...primaryColor);
+        pdf.setFontSize(28);
+        pdf.text(`${formData.catName}'s`, pageWidth / 2, pageHeight / 2 - 30, { align: 'center' });
+        
+        // Add subtitle
+        pdf.setFontSize(32);
+        pdf.setTextColor(...accentColor);
+        pdf.text('Wellness & Behavior Plan', pageWidth / 2, pageHeight / 2, { align: 'center' });
+        
+        // Add horizontal line
+        pdf.setDrawColor(...primaryColor);
+        pdf.setLineWidth(1);
+        pdf.line(margin + 20, pageHeight / 2 + 10, pageWidth - margin - 20, pageHeight / 2 + 10);
+        
+        // Add date
+        pdf.setFont('helvetica', 'italic');
+        pdf.setTextColor(...subtitleColor);
+        pdf.setFontSize(12);
+        pdf.text(`Generated on ${new Date().toLocaleDateString()}`, pageWidth / 2, pageHeight / 2 + 25, { align: 'center' });
+        
+        // Add cat outline at the bottom
+        pdf.setDrawColor(...primaryColor);
+        pdf.setLineWidth(0.8);
+        
+        // Add cat SVG image instead of manually drawing
+        const catY = pageHeight / 2 + 60;
+        
+        // Use JPG image instead of SVG since SVG doesn't work properly
+        const catImagePath = '/cat.jpg'; // JPG is in the public folder root
+        
+        try {
+          // Fixed height for the image
+          const imageHeight = 60;
+          // For cat.jpg, we'll use an aspect ratio of 4:3 (width:height)
+          // This is a common aspect ratio for photos, and we'll adjust if needed
+          const aspectRatio = 16/9;
+          const imageWidth = imageHeight * aspectRatio;
+          
+          // Add the JPG image - parameters: path, format, x, y, width, height
+          // Center the image horizontally by adjusting the x position based on the new width
+          pdf.addImage(
+            catImagePath, 
+            'JPEG', 
+            pageWidth/2 - (imageWidth/2), 
+            catY - (imageHeight/2), 
+            imageWidth, 
+            imageHeight, 
+            undefined, 
+            'FAST'
+          );
+        } catch (error) {
+          console.error('Failed to load image:', error);
+          // Fallback to a basic shape if image fails to load
+          pdf.setFillColor(...primaryColor);
+          pdf.circle(pageWidth/2, catY, 20, 'F');
+        }
+        
+        // Add CatHealth logo and copyright at the bottom
+        pdf.setFont('helvetica', 'normal');
+        pdf.setTextColor(...subtitleColor);
+        pdf.setFontSize(10);
+        pdf.text('CatHealth', pageWidth / 2, pageHeight - 30, { align: 'center' });
+        pdf.setFontSize(8);
+        pdf.text(`© ${new Date().getFullYear()} CatHealth - All rights reserved`, pageWidth / 2, pageHeight - 20, { align: 'center' });
+      };
+      
+      // Function to add text with wrapping and paragraph handling
+      const addWrappedText = (
+        text: string, 
+        x: number, 
+        y: number, 
+        maxWidth: number, 
+        fontSize: number = 11, 
+        fontStyle: string = 'normal', 
+        color: [number, number, number] = textColor, 
+        spacing: number = 1.2
+      ): number => {
+        if (!text?.trim()) return y;
+        
+        pdf.setFont('helvetica', fontStyle);
+        pdf.setFontSize(fontSize);
+        pdf.setTextColor(...color);
+        
+        // Split text into paragraphs
+        const paragraphs = text.split('\n\n');
+        let currentY = y;
+        
+        for (let i = 0; i < paragraphs.length; i++) {
+          const paragraph = paragraphs[i].trim();
+          if (!paragraph) continue;
+          
+          // Split paragraph into lines that fit the width
+          const lines = pdf.splitTextToSize(paragraph, maxWidth);
+          
+          // Process each line
+          for (let j = 0; j < lines.length; j++) {
+            const line = lines[j];
+            
+            // Add indentation and bullet styling for list items
+            if (line.trim().startsWith('•') || line.trim().startsWith('-')) {
+              // Bullet point formatting
+              pdf.text(line, x + 3, currentY);
+              currentY += fontSize * 0.55 * spacing;
+            } else if (/^\d+\.\s/.test(line.trim())) {
+              // Numbered list formatting
+              pdf.text(line, x + 3, currentY);
+              currentY += fontSize * 0.55 * spacing;
+            } else {
+              // Normal text
+              pdf.text(line, x, currentY);
+              currentY += fontSize * 0.55 * spacing;
+            }
+          }
+          
+          // Add spacing between paragraphs
+          if (i < paragraphs.length - 1) {
+            currentY += fontSize * 0.8;
+          }
+        }
+        
+        return currentY;
+      };
+      
+      // Function to add a beautiful section with a heading box
+      const addSection = (
+        title: string, 
+        content: string, 
+        x: number, 
+        y: number, 
+        maxWidth: number, 
+        pageNum: number
+      ): number => {
+        if (!content?.trim()) return y;
+        
+        // Check if we need a page break - leave some space for the header and a few lines
+        if (y > pageHeight - 70) {
+          pdf.addPage();
+          addPageHeader(pageNum + 1);
+          y = 40; // Start below header
+        }
+        
+        // Create a nice colored box for the section title
+        pdf.setFillColor(...headerBgColor);
+        pdf.roundedRect(x - 5, y - 6, maxWidth + 10, 14, 3, 3, 'F');
+        
+        // Add section title
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(14);
+        pdf.setTextColor(...primaryColor);
+        pdf.text(title, x, y);
+        
+        // Add little paw icon before title (simple circle)
+        pdf.setFillColor(...accentColor);
+        pdf.circle(x - 10, y - 1, 2, 'F');
+        
+        // Add content with spacing
+        const contentY = y + 15;
+        const endY = addWrappedText(content, x, contentY, maxWidth, 11, 'normal', textColor, 1.2);
+        
+        return endY + 8; // Return position after content with spacing
+      };
+      
+      // Function to add header to content pages
+      const addPageHeader = (pageNum: number): void => {
+        // Add top bar
+        pdf.setFillColor(...primaryColor);
+        pdf.rect(0, 0, pageWidth, 15, 'F');
+        
+        // Add cat name and page title
+        pdf.setFont('helvetica', 'bold');
+        pdf.setTextColor(255, 255, 255);
+        pdf.setFontSize(11);
+        pdf.text(`${formData.catName}'s Wellness & Behavior Plan`, margin, 10);
+        
+        // Add page number on the right
+        pdf.text(`Page ${pageNum}`, pageWidth - margin, 10, { align: 'right' });
+      };
+      
+      // Function to add a nice footer to each page
+      const addPageFooter = (pageNum: number, totalPages: number): void => {
+        // Add footer bar
+        pdf.setFillColor(...boxBgColor);
+        pdf.rect(0, pageHeight - 15, pageWidth, 15, 'F');
+        
+        // Add disclaimer text
+        pdf.setFont('helvetica', 'italic');
+        pdf.setFontSize(8);
+        pdf.setTextColor(...subtitleColor);
+        pdf.text('This wellness plan is provided for informational purposes only and does not replace professional veterinary advice.',
+          pageWidth / 2, pageHeight - 8, { align: 'center' });
+        
+        // Add page number and copyright
+        pdf.setFont('helvetica', 'normal');
+        pdf.text(`Page ${pageNum} of ${totalPages}  •  © ${new Date().getFullYear()} CatHealth`, 
+          pageWidth / 2, pageHeight - 3, { align: 'center' });
+      };
+      
+      // Improved markdown parsing
+      const extractPlainText = (markdown: string | null): string => {
+        if (!markdown) return '';
+        
+        return markdown
+          .replace(/#{1,6}\s+(.+?)(\n|$)/g, '$1\n') // Handle headings
+          .replace(/\*\*(.+?)\*\*/g, '$1') // Remove bold
+          .replace(/\*(.+?)\*/g, '$1') // Remove italic
+          .replace(/\[(.+?)\]\(.+?\)/g, '$1') // Keep link text
+          .replace(/>\s+(.+?)(\n|$)/g, '$1\n') // Remove blockquote markers
+          .replace(/^\s*[-*+]\s+(.+?)(\n|$)/gm, '• $1\n') // Better bullet list conversion
+          .replace(/^\s*(\d+)\.\s+(.+?)(\n|$)/gm, '$1. $2\n') // Keep numbered lists
+          .replace(/\n{3,}/g, '\n\n') // Normalize excessive newlines
+          .trim();
+      };
+      
+      // Extract sections with improved patterns
+      const extractSection = (
+        markdown: string, 
+        sectionName: string, 
+        nextSectionName?: string
+      ): string => {
+        // Create case-insensitive pattern
+        const pattern = nextSectionName 
+          ? new RegExp(`## ${sectionName}([\\s\\S]*?)(?=## ${nextSectionName}|$)`, 'i')
+          : new RegExp(`## ${sectionName}([\\s\\S]*)$`, 'i');
+        
+        const match = markdown.match(pattern);
+        return match ? match[1].trim() : '';
+      };
+      
+      // Extract all sections 
+      const overview = extractSection(wellnessPlan || "", "Greeting & Cat Overview", "Health Recommendations");
+      const healthText = extractSection(wellnessPlan || "", "Health Recommendations", "Behavior Training");
+      const behaviorText = extractSection(wellnessPlan || "", "Behavior Training", "Enrichment Plan");
+      const enrichmentText = extractSection(wellnessPlan || "", "Enrichment Plan", "Follow-up Schedule");
+      const followUpText = extractSection(wellnessPlan || "", "Follow-up Schedule");
+      
+      // Create the cover page
+      createCoverPage();
+      
+      // Add content pages
+      pdf.addPage();
+      addPageHeader(1);
+      
+      // Start position for content
+      let yPosition = 30;
+      let pageNum = 1;
+      
+      // Add introduction/overview with a nice box
+      if (overview) {
+        pdf.setFillColor(...boxBgColor);
+        pdf.roundedRect(margin, yPosition, contentWidth, 35, 3, 3, 'F');
+        
+        yPosition = addWrappedText(
+          extractPlainText(overview),
+          margin + 5, 
+          yPosition + 8, 
+          contentWidth - 10,
+          11,
+          'normal',
+          textColor,
+          1.2
+        );
+        
+        // Add some space after the introduction
+        yPosition += 15;
+      }
+      
+      // Add main sections with automatic pagination
+      yPosition = addSection('Health Recommendations', extractPlainText(healthText), margin, yPosition, contentWidth, pageNum);
+      
+      // Check if we need a new page
+      if (yPosition > pageHeight - 60) {
+        pdf.addPage();
+        pageNum++;
+        addPageHeader(pageNum);
+        yPosition = 30;
+      }
+      
+      yPosition = addSection('Behavior Training & Advice', extractPlainText(behaviorText), margin, yPosition, contentWidth, pageNum);
+      
+      // Check if we need a new page
+      if (yPosition > pageHeight - 60) {
+        pdf.addPage();
+        pageNum++;
+        addPageHeader(pageNum);
+        yPosition = 30;
+      }
+      
+      yPosition = addSection('Enrichment & Environment', extractPlainText(enrichmentText), margin, yPosition, contentWidth, pageNum);
+      
+      // Check if we need a new page
+      if (yPosition > pageHeight - 60) {
+        pdf.addPage();
+        pageNum++;
+        addPageHeader(pageNum);
+        yPosition = 30;
+      }
+      
+      yPosition = addSection('Follow-up Schedule', extractPlainText(followUpText), margin, yPosition, contentWidth, pageNum);
+      
+      // Add a concluding remark if there's space
+      if (yPosition < pageHeight - 70) {
+        yPosition += 20;
+        
+        // Add a nice box with concluding message
+        pdf.setFillColor(...boxBgColor);
+        pdf.roundedRect(margin, yPosition, contentWidth, 35, 3, 3, 'F');
+        
+        pdf.setFont('helvetica', 'italic');
+        pdf.setTextColor(...primaryColor);
+        pdf.setFontSize(12);
+        pdf.text(`We wish ${formData.catName} a happy and healthy life!`, 
+          pageWidth / 2, yPosition + 15, { align: 'center' });
+        
+        // Add a small cat paw print as decoration
+        pdf.setFillColor(...accentColor);
+        pdf.circle(pageWidth / 2, yPosition + 25, 3, 'F');
+        pdf.circle(pageWidth / 2 - 5, yPosition + 23, 1.5, 'F');
+        pdf.circle(pageWidth / 2 + 5, yPosition + 23, 1.5, 'F');
+        pdf.circle(pageWidth / 2 - 3, yPosition + 30, 1.5, 'F');
+        pdf.circle(pageWidth / 2 + 3, yPosition + 30, 1.5, 'F');
+      }
+      
+      // Add footers to all pages (except cover)
+      const totalPages = pdf.getNumberOfPages();
+      for (let i = 2; i <= totalPages; i++) {
+        pdf.setPage(i);
+        addPageFooter(i - 1, totalPages - 1);
+      }
+      
+      // Save the PDF
+      pdf.save(`${formData.catName}_Wellness_Plan.pdf`);
+      toast.success("Your beautifully designed PDF has been downloaded!");
+    } catch (error) {
+      console.error('Error generating PDF:', error);
+      toast.error("Failed to generate PDF. Please try again.");
+    } finally {
+      setIsGeneratingPDF(false);
+    }
+  };
   
   // Render form based on current step
   const renderForm = () => {
@@ -270,7 +730,7 @@ export default function WellnessPlanPage() {
                 >
                   <div className="mb-3 h-32 w-full relative">
                     <Image
-                      src="/playfull.svg"
+                      src="/kitty.svg"
                       alt="Kitten"
                       fill
                       className="object-contain"
@@ -533,7 +993,7 @@ export default function WellnessPlanPage() {
                 >
                   <div className="mb-3 h-32 w-full relative">
                     <Image
-                      src="/eating.svg"
+                      src="/dry.svg"
                       alt="Dry Kibble"
                       fill
                       className="object-contain"
@@ -555,7 +1015,7 @@ export default function WellnessPlanPage() {
                 >
                   <div className="mb-3 h-32 w-full relative">
                     <Image
-                      src="/comfy.svg"
+                      src="/wet.svg"
                       alt="Wet Food"
                       fill
                       className="object-contain"
@@ -797,7 +1257,7 @@ export default function WellnessPlanPage() {
                 >
                   <div className="mb-3 h-32 w-full relative">
                     <Image
-                      src="/climbing.svg"
+                      src="/playfull.svg"
                       alt="Indoor-Outdoor"
                       fill
                       className="object-contain"
@@ -1023,9 +1483,9 @@ export default function WellnessPlanPage() {
               <Label className="text-lg mb-4 block">What enrichment does your cat have at home?</Label>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 {[
-                  { value: 'Has scratching post/tree', image: '/playing.svg' },
+                  { value: 'Has scratching post/tree', image: '/tree.svg' },
                   { value: 'Has puzzle feeders or treat toys', image: '/busy.svg' },
-                  { value: 'Has hideaways (boxes/tunnels)', image: '/hiding.svg' },
+                  { value: 'Has hideaways (boxes/tunnels)', image: '/boxcat.svg' },
                   { value: 'Regular new toys or rotation', image: '/playfull.svg' }
                 ].map((enrichment) => (
                   <div 
@@ -1110,65 +1570,103 @@ export default function WellnessPlanPage() {
               <Label className="text-lg mb-4 block">What's your primary goal for your cat?</Label>
               <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                 {[
-                  { value: 'Improve behavior issue', image: '/angry.svg', label: 'Improve Behavior' },
-                  { value: 'Help my cat exercise more', image: '/lazy.svg', label: 'More Exercise' },
-                  { value: 'Nutrition or weight management', image: '/fatcat.svg', label: 'Weight Management' },
-                  { value: 'General wellness & happiness', image: '/playfull.svg', label: 'General Wellness' },
-                  { value: 'Reduce anxiety/stress', image: '/scared.svg', label: 'Reduce Anxiety' },
-                  { value: 'Other', image: '/cat.svg', label: 'Other' }
-                ].map((goal) => (
-                  <div 
-                    key={goal.value}
-                    className={`relative cursor-pointer rounded-xl border-2 p-4 transition-all hover:shadow-md ${formData.primaryGoal === goal.value ? "border-blue-500 bg-blue-50" : "border-gray-200"}`}
-                    onClick={() => handleCardSelection("primaryGoal", goal.value)}
+                  { value: 'Improve behavior issue', image: '/angry.svg', label: 'Improve Behavior', gradientFrom: 'from-red-50', gradientTo: 'to-orange-50', textFrom: 'from-red-700', textTo: 'to-orange-700' },
+                  { value: 'Help my cat exercise more', image: '/lazy.svg', label: 'More Exercise', gradientFrom: 'from-blue-50', gradientTo: 'to-indigo-50', textFrom: 'from-blue-700', textTo: 'to-indigo-700' },
+                  { value: 'Nutrition or weight management', image: '/fatcat.svg', label: 'Weight Management', gradientFrom: 'from-green-50', gradientTo: 'to-teal-50', textFrom: 'from-green-700', textTo: 'to-teal-700' },
+                  { value: 'General wellness & happiness', image: '/playfull.svg', label: 'General Wellness', gradientFrom: 'from-purple-50', gradientTo: 'to-indigo-50', textFrom: 'from-purple-700', textTo: 'to-indigo-700' },
+                  { value: 'Reduce anxiety/stress', image: '/scared.svg', label: 'Reduce Anxiety', gradientFrom: 'from-amber-50', gradientTo: 'to-yellow-50', textFrom: 'from-amber-700', textTo: 'to-yellow-700' },
+                  { value: 'Other', image: '/cat.svg', label: 'Other', gradientFrom: 'from-gray-50', gradientTo: 'to-slate-50', textFrom: 'from-gray-700', textTo: 'to-slate-700' }
+                ].map((option, index) => (
+                  <Card 
+                    key={index}
+                    className={`cursor-pointer transition-all hover:shadow-md overflow-hidden ${
+                      formData.primaryGoal === option.value ? 'border-2 border-blue-500 ring-2 ring-blue-200' : 'border border-gray-200'
+                    }`}
+                    onClick={() => handleCardSelection('primaryGoal', option.value)}
                   >
-                    <div className="mb-3 h-28 w-full relative">
-                      <Image
-                        src={goal.image}
-                        alt={goal.label}
-                        fill
-                        className="object-contain"
-                      />
-                    </div>
-                    <h3 className="text-center font-medium">{goal.label}</h3>
-                    {formData.primaryGoal === goal.value && (
-                      <div className="absolute top-2 right-2 h-6 w-6 rounded-full bg-blue-500 flex items-center justify-center">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-white">
-                          <polyline points="20 6 9 17 4 12"></polyline>
-                        </svg>
+                    <CardHeader className={`pb-2 pt-2 bg-gradient-to-r ${option.gradientFrom} ${option.gradientTo}`}>
+                      <CardTitle className="text-lg flex justify-center">
+                        <span className={`bg-gradient-to-r ${option.textFrom} ${option.textTo} bg-clip-text text-transparent`}>
+                          {option.label}
+                        </span>
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="flex flex-col items-center justify-center text-center">
+                      <div className="w-20 h-20 relative mb-2">
+                        <Image
+                          src={option.image}
+                          alt={option.label}
+                          fill
+                          className="object-contain"
+                        />
                       </div>
-                    )}
-                  </div>
+                    </CardContent>
+                  </Card>
                 ))}
               </div>
             </div>
-            
-            {!isAuthenticated && (
-              <div className="mt-10 p-6 bg-blue-50 rounded-xl border border-blue-100 shadow-sm">
+
+            {isAuthenticated ? (
+              <div className="mt-10 text-center">
+                <Button
+                  type="submit"
+                  disabled={isGeneratingPlan}
+                  className="w-full max-w-md mx-auto py-6 text-lg font-medium bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    handleSubmit(e);
+                  }}
+                >
+                  {isGeneratingPlan ? (
+                    <span className="flex items-center justify-center">
+                      <svg className="animate-spin -ml-1 mr-2 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      Generating Your Plan...
+                    </span>
+                  ) : (
+                    <span className="flex items-center justify-center">
+                      Generate Wellness Plan
+                      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="ml-2">
+                        <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"></path>
+                      </svg>
+                    </span>
+                  )}
+                </Button>
+              </div>
+            ) : (
+              <div className="mt-10 p-6 bg-blue-50 rounded-xl border border-blue-100 shadow-md">
                 <div className="flex flex-col sm:flex-row items-center gap-4">
                   <div className="w-20 h-20 relative flex-shrink-0">
                     <Image
                       src="/busy.svg"
-                      alt="Sign In"
+                      alt="Sign In Required"
                       fill
                       className="object-contain"
                     />
                   </div>
                   <div className="flex-1">
                     <h3 className="font-semibold text-blue-700 text-lg mb-2">
-                      Save Your Plan & Get Email Updates
+                      Sign In Required
                     </h3>
                     <p className="text-blue-600 mb-4">
-                      Sign in to save your wellness plan, receive it by email, and access personalized updates over time.
+                      To generate your personalized wellness plan, please sign in. This helps us save your plan, track progress, and provide future updates.
                     </p>
                     <Button 
                       onClick={handleSignIn}
-                      className="bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700"
+                      className="w-full sm:w-auto bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700"
                     >
-                      Sign In Now
+                      Sign In to Continue
                     </Button>
                   </div>
                 </div>
+              </div>
+            )}
+            
+            {!isAuthenticated && (
+              <div className="mt-6 text-center text-sm text-gray-500">
+                <p>Your responses will be saved locally until you sign in.</p>
               </div>
             )}
           </div>
@@ -1208,10 +1706,164 @@ export default function WellnessPlanPage() {
                     <TabsTrigger value="visual" className="flex-1 py-3">Visual Plan</TabsTrigger>
                   </TabsList>
                   
-                  <TabsContent value="plan" className="p-6">
+                  <TabsContent value="plan" className="p-6 relative overflow-hidden">
+                    {/* Decorative background elements */}
+                    <div className="absolute -top-10 -right-10 w-40 h-40 bg-gradient-to-br from-indigo-50 to-purple-50 rounded-full opacity-60 no-print"></div>
+                    <div className="absolute -bottom-10 -left-10 w-40 h-40 bg-gradient-to-tr from-blue-50 to-indigo-50 rounded-full opacity-60 no-print"></div>
+                    <div className="absolute top-1/2 -right-6 w-24 h-24 bg-gradient-to-r from-purple-50 to-indigo-50 rounded-full opacity-50 no-print"></div>
+                    <div className="absolute bottom-20 left-10 w-16 h-16 bg-gradient-to-r from-indigo-50 to-blue-50 rounded-full opacity-40 no-print"></div>
+                    
+                    {/* Download PDF button */}
+                    {wellnessPlan && (
+                      <div className="absolute top-3 right-3 z-20 no-print">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="flex items-center gap-1 border-indigo-300 bg-gradient-to-r from-indigo-100 to-purple-100 hover:from-indigo-200 hover:to-purple-200 hover:text-indigo-800 text-indigo-700 shadow-md transition-all duration-300"
+                          onClick={handleDownloadPDF}
+                          disabled={isGeneratingPDF}
+                        >
+                          {isGeneratingPDF ? (
+                            <>
+                              <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-indigo-700" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                              </svg>
+                              Creating Beautiful PDF...
+                            </>
+                          ) : (
+                            <>
+                              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-indigo-700">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                <polyline points="7 10 12 15 17 10"></polyline>
+                                <line x1="12" y1="15" x2="12" y2="3"></line>
+                              </svg>
+                              Download Beautiful PDF
+                            </>
+                          )}
+                        </Button>
+                      </div>
+                    )}
+                    
                     {wellnessPlan ? (
-                      <div className="prose prose-sm md:prose-base max-w-none prose-headings:text-blue-700 prose-a:text-indigo-600 prose-strong:text-blue-900">
-                        <div dangerouslySetInnerHTML={{ __html: wellnessPlan.replace(/\n/g, '<br>') }} />
+                      <div className="prose prose-sm md:prose-base max-w-none relative z-10 print-content" ref={pdfContentRef}>
+                        <div className="absolute top-0 right-0 w-24 h-24 text-indigo-100 no-print">
+                          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" strokeWidth="0">
+                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z" opacity="0.3"></path>
+                            <path d="M12 4c-4.41 0-8 3.59-8 8s3.59 8 8 8 8-3.59 8-8-3.59-8-8-8zm0 14c-3.31 0-6-2.69-6-6s2.69-6 6-6 6 2.69 6 6-2.69 6-6 6z" opacity="0.5"></path>
+                            <path d="M12 6c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm0 10c-2.21 0-4-1.79-4-4s1.79-4 4-4 4 1.79 4 4-1.79 4-4 4z" opacity="0.7"></path>
+                            <path d="M12 8c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4-1.79-4-4-4zm0 6c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z" opacity="0.9"></path>
+                            <circle cx="12" cy="12" r="1.5" opacity="1"></circle>
+                          </svg>
+                        </div>
+                      
+                        <ReactMarkdown 
+                          components={{
+                            h1: ({ children }) => (
+                              <>
+                                <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-700 via-indigo-600 to-purple-700 bg-clip-text text-transparent pb-2 border-b border-blue-100 mb-4">
+                                  {children}
+                                </h1>
+                                <div className="w-20 h-1 bg-gradient-to-r from-blue-500 to-indigo-500 rounded mb-6"></div>
+                              </>
+                            ),
+                            h2: ({ children }) => (
+                              <div className="mt-8 mb-4">
+                                <div className="flex items-center mb-2">
+                                  <div className="w-8 h-8 rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 flex items-center justify-center text-white mr-2">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                      <path d="M5 12h14"></path>
+                                      <path d="M12 5v14"></path>
+                                    </svg>
+                                  </div>
+                                  <h2 className="text-xl font-bold bg-gradient-to-r from-indigo-600 to-purple-600 bg-clip-text text-transparent">
+                                    {children}
+                                  </h2>
+                                </div>
+                                <div className="w-full h-px bg-gradient-to-r from-indigo-100 to-purple-100"></div>
+                              </div>
+                            ),
+                            h3: ({ children }) => (
+                              <h3 className="text-lg font-semibold text-indigo-600 mt-5 mb-2 flex items-center">
+                                <div className="w-2 h-6 bg-indigo-400 rounded mr-2"></div>
+                                {children}
+                              </h3>
+                            ),
+                            h4: ({ children }) => (
+                              <h4 className="text-base font-semibold text-blue-500 mt-4 mb-2 flex items-center">
+                                <span className="w-1.5 h-1.5 bg-blue-400 rounded-full mr-2"></span>
+                                {children}
+                              </h4>
+                            ),
+                            p: ({ children }) => <p className="text-gray-700 mb-4 leading-relaxed">{children}</p>,
+                            ul: ({ children }) => (
+                              <div className="bg-blue-50/50 rounded-lg p-4 my-4 border border-blue-100">
+                                <ul className="pl-2 space-y-2">{children}</ul>
+                              </div>
+                            ),
+                            ol: ({ children }) => (
+                              <div className="bg-indigo-50/50 rounded-lg p-4 my-4 border border-indigo-100">
+                                <ol className="pl-8 space-y-2">{children}</ol>
+                              </div>
+                            ),
+                            li: ({ children }) => (
+                              <li className="text-gray-700 flex items-start">
+                                <div className="w-4 h-4 rounded-full bg-gradient-to-r from-blue-400 to-indigo-500 flex items-center justify-center text-white text-xs mt-1 mr-2 flex-shrink-0">✓</div>
+                                <span>{children}</span>
+                              </li>
+                            ),
+                            strong: ({ children }) => (
+                              <strong className="font-bold text-indigo-900 bg-indigo-50 px-1 rounded">
+                                {children}
+                              </strong>
+                            ),
+                            em: ({ children }) => <em className="text-purple-700 italic">{children}</em>,
+                            blockquote: ({ children }) => (
+                              <div className="my-6">
+                                <blockquote className="border-l-4 border-indigo-300 pl-4 py-3 bg-gradient-to-r from-indigo-50 to-blue-50 rounded-r-lg text-gray-700 italic relative">
+                                  <div className="absolute top-0 left-0 text-indigo-200 transform -translate-y-1/2 -translate-x-1/2">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                                      <path d="M14.017 21v-7.391c0-5.704 3.731-9.57 8.983-10.609l.995 2.151c-2.432.917-3.995 3.638-3.995 5.849h4v10h-9.983zm-14.017 0v-7.391c0-5.704 3.748-9.57 9-10.609l.996 2.151c-2.433.917-3.996 3.638-3.996 5.849h3.983v10h-9.983z" />
+                                    </svg>
+                                  </div>
+                                  {children}
+                                </blockquote>
+                              </div>
+                            ),
+                            hr: () => (
+                              <div className="flex items-center justify-center my-6">
+                                <div className="w-1/3 h-px bg-gradient-to-r from-transparent via-indigo-300 to-transparent"></div>
+                                <div className="w-2 h-2 rounded-full bg-indigo-400 mx-2"></div>
+                                <div className="w-1/3 h-px bg-gradient-to-r from-transparent via-indigo-300 to-transparent"></div>
+                              </div>
+                            ),
+                            a: ({ href, children }) => (
+                              <a 
+                                href={href} 
+                                className="font-medium text-blue-600 underline decoration-blue-300 underline-offset-2 hover:text-blue-800 hover:decoration-blue-500 transition-all"
+                              >
+                                {children}
+                              </a>
+                            ),
+                            img: ({ src, alt }) => (
+                              <div className="my-6 rounded-lg overflow-hidden shadow-md">
+                                <img src={src || ''} alt={alt || ''} className="w-full h-auto" />
+                              </div>
+                            ),
+                            table: ({ children }) => (
+                              <div className="overflow-hidden rounded-lg shadow-sm border border-indigo-100 my-6">
+                                <table className="min-w-full divide-y divide-indigo-200">{children}</table>
+                              </div>
+                            ),
+                            thead: ({ children }) => <thead className="bg-indigo-50">{children}</thead>,
+                            tbody: ({ children }) => <tbody className="divide-y divide-indigo-100 bg-white">{children}</tbody>,
+                            tr: ({ children }) => <tr>{children}</tr>,
+                            th: ({ children }) => <th className="px-4 py-3 text-left text-xs font-medium text-indigo-700 uppercase tracking-wider">{children}</th>,
+                            td: ({ children }) => <td className="px-4 py-3 text-sm">{children}</td>
+                          }}
+                        >
+                          {wellnessPlan}
+                        </ReactMarkdown>
                       </div>
                     ) : (
                       <div className="flex flex-col items-center justify-center py-10">
@@ -1384,7 +2036,10 @@ export default function WellnessPlanPage() {
                   setCurrentStep(1)
                   setWellnessPlan(null)
                   setWellnessPlanData(null)
-                  setIsPlanGenerated(false) // Reset the plan generation state
+                  setIsPlanGenerated(false)
+                  // Clear localStorage data when starting over
+                  localStorage.removeItem('catWellnessFormData');
+                  localStorage.removeItem('catWellnessFormStep');
                 }}
                 variant="outline"
                 className="px-8 py-6 text-lg font-medium"
@@ -1401,6 +2056,37 @@ export default function WellnessPlanPage() {
   
   return (
     <div className="min-h-screen py-12 relative overflow-hidden">
+      {/* Print Styles */}
+      <style jsx global>{`
+        @media print {
+          body * {
+            visibility: hidden;
+          }
+          
+          .print-content,
+          .print-content * {
+            visibility: visible;
+          }
+          
+          .print-content {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            padding: 2rem;
+          }
+          
+          .no-print {
+            display: none !important;
+          }
+          
+          @page {
+            size: portrait;
+            margin: 1.5cm;
+          }
+        }
+      `}</style>
+      
       {/* Gradient Background */}
       <div className="absolute inset-0 bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50 z-0"></div>
       
@@ -1486,31 +2172,7 @@ export default function WellnessPlanPage() {
                           <path d="m9 18 6-6-6-6"/>
                         </svg>
                       </Button>
-                    ) : (
-                      <Button
-                        type="submit"
-                        disabled={isSubmitting}
-                        className="px-6 py-2.5 font-medium bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700"
-                      >
-                        {isSubmitting ? (
-                          <span className="flex items-center">
-                            <svg className="animate-spin -ml-1 mr-2 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                            </svg>
-                            Generating Plan...
-                          </span>
-                        ) : (
-                          <span className="flex items-center">
-                            Generate Wellness Plan
-                            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="ml-2">
-                              <path d="M5 12h14"></path>
-                              <path d="m12 5 7 7-7 7"></path>
-                            </svg>
-                          </span>
-                        )}
-                      </Button>
-                    )}
+                    ) : null /* Removed the submit button here since we added it directly in step 5 */}
                   </div>
                 )}
               </form>
