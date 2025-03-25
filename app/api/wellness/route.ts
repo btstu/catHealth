@@ -29,6 +29,22 @@ type WellnessPlanData = {
 
 export async function POST(request: NextRequest) {
   try {
+    // Check authentication first
+    const cookieStore = cookies();
+    const supabase = createClient(cookieStore);
+    const { data: { session } } = await supabase.auth.getSession();
+    
+    // If not authenticated, return error
+    if (!session || !session.user) {
+      console.warn('Authentication check failed - user attempted to generate a wellness plan without authentication');
+      return NextResponse.json(
+        { error: 'Authentication required to generate a wellness plan' },
+        { status: 401 }
+      );
+    }
+    
+    console.log(`Authenticated user ${session.user.email} generating wellness plan`);
+    
     // Parse the form data
     const formData = await request.formData();
     
@@ -59,7 +75,7 @@ export async function POST(request: NextRequest) {
     
     // Owner's goals
     const primaryGoal = formData.get('primaryGoal') as string;
-    const userEmail = formData.get('userEmail') as string;
+    const userEmail = formData.get('userEmail') as string || session.user.email;
     
     // Validation
     if (!catName) {
@@ -222,10 +238,6 @@ export async function POST(request: NextRequest) {
     }
 
     // If user is authenticated, save the plan to their account
-    const cookieStore = cookies();
-    const supabase = createClient(cookieStore);
-    const { data: { session } } = await supabase.auth.getSession();
-    
     if (session && session.user && userEmail) {
       // Check if the user has a plan already
       const { data: existingPlans } = await supabase

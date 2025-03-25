@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { Label } from "@/components/ui/label"
 import { createClient } from '@/utils/supabase/client'
 import { toast } from "sonner"
@@ -32,6 +32,7 @@ const Progress = ({ value = 0, className = "", indicatorClassName = "" }) => {
 export default function WellnessPlanPage() {
   const supabase = createClient()
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [currentStep, setCurrentStep] = useState(1)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isAuthenticated, setIsAuthenticated] = useState(false)
@@ -46,6 +47,13 @@ export default function WellnessPlanPage() {
   const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
   const pdfContentRef = useRef<HTMLDivElement>(null);
   const totalSteps = 5
+  
+  // Utility function to clear localStorage data
+  const clearLocalStorage = () => {
+    console.log('Clearing localStorage data');
+    localStorage.removeItem('catWellnessFormData');
+    localStorage.removeItem('catWellnessFormStep');
+  };
   
   // Form data state
   const [formData, setFormData] = useState({
@@ -83,58 +91,201 @@ export default function WellnessPlanPage() {
     // Only attempt to load once
     if (formDataLoaded) return;
     
-    try {
-      const savedFormData = localStorage.getItem('catWellnessFormData');
-      if (savedFormData) {
-        const parsedData = JSON.parse(savedFormData);
-        setFormData(parsedData);
-        console.log('Form data loaded from localStorage');
+    const loadFormData = async () => {
+      try {
+        // Check if user is authenticated
+        const { data } = await supabase.auth.getSession();
+        
+        // If not authenticated or we're coming back from authentication process,
+        // load saved form data
+        const savedFormData = localStorage.getItem('catWellnessFormData');
+        if (savedFormData) {
+          try {
+            const parsedData = JSON.parse(savedFormData);
+            setFormData(parsedData);
+            console.log('Form data loaded from localStorage');
+          } catch (e) {
+            console.error('Error parsing form data:', e);
+            // If parsing fails, clear the corrupted data
+            clearLocalStorage();
+          }
+        }
+      } catch (error) {
+        console.error('Error loading form data from localStorage:', error);
       }
-    } catch (error) {
-      console.error('Error loading form data from localStorage:', error);
-    }
+      
+      setFormDataLoaded(true);
+    };
     
-    setFormDataLoaded(true);
-  }, [formDataLoaded]);
+    loadFormData();
+  }, [formDataLoaded, supabase.auth]);
   
-  // Check authentication status
+  // Check authentication status and listen for changes
   useEffect(() => {
     const checkUser = async () => {
       const { data: { session } } = await supabase.auth.getSession()
-      if (session) {
-        setIsAuthenticated(true)
-        setUser(session.user)
-        setUserEmail(session.user.email || "")
-        
-        // Check URL params for returning from auth flow
-        const params = new URLSearchParams(window.location.search);
-        const fromAuth = params.get('fromAuth');
-        
-        if (fromAuth === 'true') {
-          // If returning from auth, check if we have saved form step
-          const savedStep = localStorage.getItem('catWellnessFormStep');
-          if (savedStep) {
-            setCurrentStep(parseInt(savedStep, 10));
-          }
+      // Update authentication state based on session
+      setIsAuthenticated(!!session)
+      setUser(session?.user || null)
+      setUserEmail(session?.user?.email || "")
+      
+      // Check URL params for returning from auth flow
+      const fromAuth = searchParams.get('fromAuth');
+      
+      if (session && fromAuth === 'true') {
+        // If returning from auth, restore the form state before clearing localStorage
+        const savedStep = localStorage.getItem('catWellnessFormStep');
+        if (savedStep) {
+          const step = parseInt(savedStep, 10);
+          console.log('Restoring to step:', step);
+          setCurrentStep(step);
           
-          // Remove the query parameter using history API to clean up URL
-          const newUrl = window.location.pathname;
-          window.history.replaceState({}, document.title, newUrl);
+          // If user was on step 5 (the final step) and has now authenticated,
+          // automatically trigger the form submission after a short delay
+          // to allow the form state to be fully restored
+          if (step === 5) {
+            console.log('User has returned from auth on the final step - will auto-submit form');
+            // Set a flag to submit the form after a delay (in a separate useEffect)
+            setTimeout(() => {
+              setIsSubmitting(true);
+              setIsGeneratingPlan(true);
+              // We'll handle the actual submission in a separate useEffect that watches isGeneratingPlan
+            }, 1000);
+          }
+        }
+        
+        // Remove the query parameter using history API to clean up URL
+        const newUrl = window.location.pathname;
+        window.history.replaceState({}, document.title, newUrl);
+        
+        // IMPORTANT: Only clear localStorage after we've restored the form data
+        // and step, and only if we don't need it anymore (which is only when a plan is generated)
+        // Otherwise, we need to keep the form data until the user generates a plan
+        if (isPlanGenerated) {
+          clearLocalStorage();
         }
       }
     }
     
+    // Initial check
     checkUser()
-  }, [supabase.auth])
+    
+    // Listen for auth state changes (sign in/sign out)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      console.log('Auth state changed:', _event, !!session);
+      setIsAuthenticated(!!session);
+      setUser(session?.user || null);
+      setUserEmail(session?.user?.email || "");
+      
+      // If logged in, clear localStorage except when returning from auth flow
+      if (session && _event === 'SIGNED_IN' && searchParams.get('fromAuth') !== 'true') {
+        console.log('User signed in, clearing localStorage');
+        clearLocalStorage();
+      }
+      
+      // If logged out, make sure we cannot submit the plan
+      if (!session) {
+        setIsPlanGenerated(false);
+      }
+    });
+    
+    // Cleanup subscription
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [supabase.auth, searchParams, isPlanGenerated]);
   
   // Save form data to localStorage whenever it changes
   useEffect(() => {
-    // Only save if the form has been interacted with (not empty default state)
-    if (formDataLoaded && (formData.catName || formData.catBreed || formData.catAge || formData.behaviorIssues.length > 0)) {
+    // Only save if:
+    // 1. Form data has been loaded initially
+    // 2. The form has been interacted with (not empty default state)
+    // 3. The user is NOT authenticated (we don't need localStorage when authenticated)
+    if (formDataLoaded && 
+        !isAuthenticated &&
+        (formData.catName || formData.catBreed || formData.catAge || formData.behaviorIssues.length > 0)) {
+      // Save form data to localStorage
       localStorage.setItem('catWellnessFormData', JSON.stringify(formData));
       localStorage.setItem('catWellnessFormStep', currentStep.toString());
+      console.log('Form data saved to localStorage, current step:', currentStep);
+    } else if (formDataLoaded && isAuthenticated) {
+      // If user is authenticated, ensure localStorage is cleared
+      clearLocalStorage();
     }
-  }, [formData, currentStep, formDataLoaded]);
+  }, [formData, currentStep, formDataLoaded, isAuthenticated]);
+  
+  // Add a new useEffect to handle auto-submission after authentication
+  useEffect(() => {
+    // This effect is triggered when isGeneratingPlan changes to true after returning from auth
+    if (isGeneratingPlan && isAuthenticated && searchParams.get('fromAuth') === 'true' && currentStep === 5) {
+      // Create a function to handle form submission after authentication
+      const submitFormAfterAuth = async () => {
+        console.log('Auto-submitting form after authentication');
+        try {
+          // Create form data for API request
+          const apiFormData = new FormData();
+          
+          // Add all form fields
+          Object.entries(formData).forEach(([key, value]) => {
+            if (Array.isArray(value)) {
+              // Handle array values like behavioral issues, favorite activities, etc.
+              value.forEach(item => {
+                apiFormData.append(key, item);
+              });
+            } else {
+              apiFormData.append(key, value as string);
+            }
+          });
+          
+          // Add email if authenticated
+          if (user?.email) {
+            apiFormData.append('userEmail', user.email);
+          }
+          
+          // Submit to API
+          const response = await fetch('/api/wellness', {
+            method: 'POST',
+            body: apiFormData,
+          });
+          
+          if (response.status === 401) {
+            // Session expired or not authenticated
+            setIsAuthenticated(false);
+            toast.error("Authentication required. Please sign in again.");
+            return;
+          }
+          
+          if (!response.ok) {
+            throw new Error('Failed to generate wellness plan');
+          }
+          
+          const data = await response.json();
+          
+          // Store the wellness plan data
+          setWellnessPlan(data.wellnessPlan);
+          setWellnessPlanData(data.wellnessPlanData);
+          setIsPlanGenerated(true); // Mark that the plan has been generated
+          
+          // Update authentication status based on API response
+          setIsAuthenticated(data.isAuthenticated);
+          
+          // Move to results (step 6)
+          setCurrentStep(6);
+          
+          toast.success(`${formData.catName}'s wellness plan generated successfully!`);
+        } catch (error) {
+          toast.error('Error generating wellness plan');
+          console.error(error);
+        } finally {
+          setIsSubmitting(false);
+          setIsGeneratingPlan(false);
+        }
+      };
+      
+      // Call the function to submit the form
+      submitFormAfterAuth();
+    }
+  }, [isGeneratingPlan, isAuthenticated, searchParams, currentStep, formData, user]);
   
   // Handle form input changes
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
@@ -172,6 +323,11 @@ export default function WellnessPlanPage() {
       return
     }
     
+    // If user is authenticated, clear localStorage as we're navigating through the form
+    if (isAuthenticated) {
+      clearLocalStorage();
+    }
+    
     // Move to next step if valid
     if (currentStep < totalSteps) {
       setCurrentStep(currentStep + 1)
@@ -179,6 +335,11 @@ export default function WellnessPlanPage() {
   }
   
   const prevStep = () => {
+    // If user is authenticated, clear localStorage as we're navigating through the form
+    if (isAuthenticated) {
+      clearLocalStorage();
+    }
+    
     if (currentStep > 1) {
       setCurrentStep(currentStep - 1)
     }
@@ -188,9 +349,17 @@ export default function WellnessPlanPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     
-    // Check if user is authenticated before proceeding
+    // Check immediate local state first
     if (!isAuthenticated) {
       toast.error("Please sign in to generate your wellness plan")
+      return
+    }
+    
+    // Double-check authentication with the server before proceeding
+    const { data: { session } } = await supabase.auth.getSession()
+    if (!session) {
+      setIsAuthenticated(false) // Update local state to match server state
+      toast.error("Your session has expired. Please sign in again to generate your wellness plan")
       return
     }
     
@@ -230,6 +399,13 @@ export default function WellnessPlanPage() {
         body: apiFormData,
       })
       
+      if (response.status === 401) {
+        // Session expired or not authenticated
+        setIsAuthenticated(false)
+        toast.error("Authentication required. Please sign in again.")
+        return
+      }
+      
       if (!response.ok) {
         throw new Error('Failed to generate wellness plan')
       }
@@ -247,9 +423,10 @@ export default function WellnessPlanPage() {
       // Move to results (step 6)
       setCurrentStep(6)
       
-      // Clear localStorage data as we've successfully generated the plan
-      localStorage.removeItem('catWellnessFormData');
-      localStorage.removeItem('catWellnessFormStep');
+      // Note: localStorage clearing is now handled at button click time
+      // so we don't need to clear it again here
+      
+      toast.success(`${formData.catName}'s wellness plan generated successfully!`);
     } catch (error) {
       toast.error('Error generating wellness plan')
       console.error(error)
@@ -261,12 +438,26 @@ export default function WellnessPlanPage() {
   
   // Handle sending wellness plan to email
   const handleSendEmail = async () => {
-    if (!userEmail) {
-      toast.error('Please enter your email address')
-      return
+    // Check authentication before sending email
+    if (!isAuthenticated) {
+      toast.error('Please sign in to send the wellness plan via email');
+      return;
     }
     
-    setIsEmailSending(true)
+    // Double-check authentication with the server
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) {
+      setIsAuthenticated(false);
+      toast.error('Your session has expired. Please sign in again to send emails.');
+      return;
+    }
+    
+    if (!userEmail) {
+      toast.error('Please enter your email address');
+      return;
+    }
+    
+    setIsEmailSending(true);
     
     try {
       const response = await fetch('/api/wellness/email', {
@@ -277,31 +468,54 @@ export default function WellnessPlanPage() {
         body: JSON.stringify({
           userEmail,
           wellnessPlan,
+          planId: wellnessPlanData?.id,
+          catName: formData.catName,
         }),
-      })
+      });
       
-      if (!response.ok) {
-        throw new Error('Failed to send wellness plan')
+      if (response.status === 401) {
+        // Handle authentication errors
+        setIsAuthenticated(false);
+        toast.error('Authentication required. Please sign in again to send emails.');
+        return;
       }
       
-      const data = await response.json()
-      toast.success(data.message || 'Wellness plan sent to your email')
+      if (!response.ok) {
+        throw new Error('Failed to send wellness plan');
+      }
+      
+      const data = await response.json();
+      toast.success(data.message || 'Wellness plan sent to your email');
     } catch (error) {
-      toast.error('Error sending wellness plan to email')
-      console.error(error)
+      toast.error('Error sending wellness plan to email');
+      console.error(error);
     } finally {
-      setIsEmailSending(false)
+      setIsEmailSending(false);
     }
   }
   
   // Handle sign in redirection
   const handleSignIn = () => {
-    // Save current form state and step before redirecting
+    console.log('Saving form state before redirecting to sign in');
+    
+    // Always save current form state and step before redirecting
+    // This ensures we have the data when we return from the auth process
     localStorage.setItem('catWellnessFormData', JSON.stringify(formData));
     localStorage.setItem('catWellnessFormStep', currentStep.toString());
+    console.log(`Saved current step (${currentStep}) to localStorage before sign in`);
     
     // Redirect to sign in with a callback URL that includes a flag
     router.push(`/signin?callbackUrl=${encodeURIComponent('/wellness?fromAuth=true')}`)
+  }
+  
+  // Handle starting over
+  const handleStartOver = () => {
+    setCurrentStep(1);
+    setWellnessPlan(null);
+    setWellnessPlanData(null);
+    setIsPlanGenerated(false);
+    // Clear localStorage data when starting over
+    clearLocalStorage();
   }
   
   // Progress bar calculation
@@ -700,9 +914,12 @@ export default function WellnessPlanPage() {
     }
   };
   
-  // Render form based on current step
+  // Form rendering based on current step
   const renderForm = () => {
-    switch (currentStep) {
+    // Type currentStep as number to avoid TypeScript errors in case statements
+    const step = currentStep as number;
+    
+    switch (step) {
       case 1:
         return (
           <div className="space-y-6">
@@ -1614,6 +1831,12 @@ export default function WellnessPlanPage() {
                   className="w-full max-w-md mx-auto py-6 text-lg font-medium bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700"
                   onClick={(e) => {
                     e.preventDefault();
+                    
+                    // Clear localStorage immediately when the button is clicked
+                    console.log('Generate button clicked, clearing localStorage immediately');
+                    clearLocalStorage();
+                    
+                    // Continue with form submission
                     handleSubmit(e);
                   }}
                 >
@@ -1654,7 +1877,15 @@ export default function WellnessPlanPage() {
                       To generate your personalized wellness plan, please sign in. This helps us save your plan, track progress, and provide future updates.
                     </p>
                     <Button 
-                      onClick={handleSignIn}
+                      onClick={() => {
+                        // Ensure we're saving step 5 to localStorage before redirecting
+                        localStorage.setItem('catWellnessFormData', JSON.stringify(formData));
+                        localStorage.setItem('catWellnessFormStep', currentStep.toString()); // Explicitly setting to step 5
+                        console.log('Saved step 5 to localStorage before sign in');
+                        
+                        // Call the regular sign in handler
+                        handleSignIn();
+                      }}
                       className="w-full sm:w-auto bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700"
                     >
                       Sign In to Continue
@@ -1672,6 +1903,61 @@ export default function WellnessPlanPage() {
           </div>
         )
       case 6:
+        // If user is no longer authenticated, redirect to step 5 and require sign-in
+        if (!isAuthenticated) {
+          // Reset to final step of form
+          setCurrentStep(5);
+          setWellnessPlan(null);
+          setWellnessPlanData(null);
+          setIsPlanGenerated(false);
+          
+          // Show error message
+          toast.error("Authentication required. Please sign in to generate and view your wellness plan.");
+          
+          // Return step 5 content
+          return (
+            <div className="space-y-6">
+              <h2 className="text-2xl font-semibold text-center mb-6">Authentication Required</h2>
+              
+              <div className="mt-4 p-6 bg-blue-50 rounded-xl border border-blue-100 shadow-md">
+                <div className="flex flex-col sm:flex-row items-center gap-4">
+                  <div className="w-20 h-20 relative flex-shrink-0">
+                    <Image
+                      src="/busy.svg"
+                      alt="Sign In Required"
+                      fill
+                      className="object-contain"
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <h3 className="font-semibold text-blue-700 text-lg mb-2">
+                      Sign In Required
+                    </h3>
+                    <p className="text-blue-600 mb-4">
+                      Your session has expired. To generate your personalized wellness plan, please sign in again.
+                    </p>
+                    <Button 
+                      onClick={() => {
+                        // Ensure we're saving step 5 to localStorage before redirecting
+                        localStorage.setItem('catWellnessFormData', JSON.stringify(formData));
+                        localStorage.setItem('catWellnessFormStep', '5'); // Explicitly setting to step 5
+                        console.log('Session expired - saved step 5 to localStorage before sign in');
+                        
+                        // Call the regular sign in handler
+                        handleSignIn();
+                      }}
+                      className="w-full sm:w-auto bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700"
+                    >
+                      Sign In to Continue
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        }
+        
+        // Continue with regular results page if authenticated
         return (
           <div className="space-y-8">
             <div className="text-center mb-8">
@@ -2032,15 +2318,7 @@ export default function WellnessPlanPage() {
             {/* Start over */}
             <div className="flex justify-center mt-10">
               <Button 
-                onClick={() => {
-                  setCurrentStep(1)
-                  setWellnessPlan(null)
-                  setWellnessPlanData(null)
-                  setIsPlanGenerated(false)
-                  // Clear localStorage data when starting over
-                  localStorage.removeItem('catWellnessFormData');
-                  localStorage.removeItem('catWellnessFormStep');
-                }}
+                onClick={handleStartOver}
                 variant="outline"
                 className="px-8 py-6 text-lg font-medium"
               >
@@ -2188,6 +2466,26 @@ export default function WellnessPlanPage() {
           </div>
         </div>
       </div>
+
+      {/* Add a small debugging indicator at the bottom */}
+      {process.env.NODE_ENV !== 'production' && (
+        <div className="text-xs text-gray-400 mt-2 text-center">
+          <div>LocalStorage: {localStorage.getItem('catWellnessFormData') ? 'Data exists' : 'No data'}</div>
+          <div>Current Step: {currentStep}, Stored Step: {localStorage.getItem('catWellnessFormStep') || 'None'}</div>
+          <div>Auth Status: {isAuthenticated ? `Logged In as ${userEmail}` : 'Not Logged In'}</div>
+          <div>Plan Generated: {isPlanGenerated ? 'Yes' : 'No'}</div>
+          <div>From Auth Flow: {searchParams.get('fromAuth') === 'true' ? 'Yes' : 'No'}</div>
+          <button 
+            onClick={async () => {
+              const { data } = await supabase.auth.getSession();
+              console.log('Current auth session:', data.session);
+            }}
+            className="text-xs text-blue-400 underline"
+          >
+            Check Auth State
+          </button>
+        </div>
+      )}
     </div>
   )
 } 
